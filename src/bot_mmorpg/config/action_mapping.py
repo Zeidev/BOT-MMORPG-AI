@@ -18,7 +18,7 @@ Output Design:
 - Discrete: Button presses for skills
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum, auto
 from typing import Dict, List, Optional
 
@@ -49,6 +49,11 @@ class ActionDefinition:
     is_toggle: bool = False  # True for toggle states (autorun)
     cooldown_ms: int = 0  # Minimum time between activations
     description: str = ""
+    label: str = ""  # Short name used by the inference pipeline (logging/debug)
+
+    def display_label(self) -> str:
+        """Label used by the runtime pipeline for logs and debugging."""
+        return self.label or self.gamepad_binding or self.name
 
 
 @dataclass
@@ -661,6 +666,84 @@ NO_ACTION = ActionDefinition(
 )
 
 
+# -----------------------------------------------------------------------------
+# Keyboard base actions (slots 0-8)
+# -----------------------------------------------------------------------------
+# These nine slots are the layout the data-collection / training / inference
+# pipeline has always used: the four cardinal directions, the four diagonals,
+# and an idle sentinel for "no movement key is currently held".
+#
+# Slot 8 is deliberately the idle sentinel and NOT ``jump`` (which lives at
+# slot 8 of the full ``MOVEMENT_ACTIONS`` list). Trained checkpoints encode
+# slot 8 as "nothing pressed", so the standard space must keep that meaning.
+# Changing it would silently make every existing model jump instead of idle.
+
+NO_KEY_ACTION = ActionDefinition(
+    8,
+    "no_keys",
+    ActionCategory.MOVEMENT,
+    None,
+    None,
+    label="nokeys",
+    description="No movement key held (idle sentinel)",
+)
+
+# Short labels the runtime pipeline logs, matching the historical ACTION_NAMES.
+_KEYBOARD_LABELS = (
+    "straight",
+    "reverse",
+    "left",
+    "right",
+    "forward+left",
+    "forward+right",
+    "reverse+left",
+    "reverse+right",
+    "nokeys",
+)
+
+#: The nine keyboard slots (indices 0-8) shared by the "basic" and "standard"
+#: action spaces. Order and ``key_binding`` values are load-bearing: the
+#: recorder (``collect_data.keys_to_output``) and the executor
+#: (``test_model.execute_action``) both index into this list directly.
+KEYBOARD_BASE_ACTIONS: List[ActionDefinition] = [
+    replace(action, label=label)
+    for action, label in zip(MOVEMENT_ACTIONS[:8] + [NO_KEY_ACTION], _KEYBOARD_LABELS)
+]
+
+#: Index of the idle sentinel within :data:`KEYBOARD_BASE_ACTIONS`.
+NO_KEY_ACTION_ID = NO_KEY_ACTION.id
+
+#: The twenty gamepad slots (indices 9-28) of the "standard" action space.
+_STANDARD_GAMEPAD_ACTIONS: List[ActionDefinition] = [
+    ActionDefinition(9, "gamepad_lt", ActionCategory.COMBAT, None, "LT"),
+    ActionDefinition(10, "gamepad_rt", ActionCategory.COMBAT, None, "RT"),
+    ActionDefinition(11, "gamepad_lx", ActionCategory.MOVEMENT, None, "Lx", True),
+    ActionDefinition(12, "gamepad_ly", ActionCategory.MOVEMENT, None, "Ly", True),
+    ActionDefinition(13, "gamepad_rx", ActionCategory.CAMERA, None, "Rx", True),
+    ActionDefinition(14, "gamepad_ry", ActionCategory.CAMERA, None, "Ry", True),
+    ActionDefinition(15, "gamepad_up", ActionCategory.UI, None, "UP"),
+    ActionDefinition(16, "gamepad_down", ActionCategory.UI, None, "DOWN"),
+    ActionDefinition(17, "gamepad_left", ActionCategory.UI, None, "LEFT"),
+    ActionDefinition(18, "gamepad_right", ActionCategory.UI, None, "RIGHT"),
+    ActionDefinition(19, "gamepad_start", ActionCategory.UI, None, "START"),
+    ActionDefinition(20, "gamepad_select", ActionCategory.UI, None, "SELECT"),
+    ActionDefinition(21, "gamepad_l3", ActionCategory.MOVEMENT, None, "L3"),
+    ActionDefinition(22, "gamepad_r3", ActionCategory.CAMERA, None, "R3"),
+    ActionDefinition(23, "gamepad_lb", ActionCategory.SKILLS, None, "LB"),
+    ActionDefinition(24, "gamepad_rb", ActionCategory.SKILLS, None, "RB"),
+    ActionDefinition(25, "gamepad_a", ActionCategory.COMBAT, None, "A"),
+    ActionDefinition(26, "gamepad_b", ActionCategory.COMBAT, None, "B"),
+    ActionDefinition(27, "gamepad_x", ActionCategory.SKILLS, None, "X"),
+    ActionDefinition(28, "gamepad_y", ActionCategory.SKILLS, None, "Y"),
+]
+
+#: Mouse slots appended after the discrete actions when a model is trained with
+#: mouse capture enabled. ``collect_data`` writes the 6-value legacy layout
+#: (``mouse_state.to_array()``), so that is the shape the pipeline produces.
+MOUSE_OUTPUT_SIZE = 6
+MOUSE_ACTION_ID = 72  # first mouse slot == len(KEYBOARD_BASE_ACTIONS) + 20
+
+
 # =============================================================================
 # Action Space Configurations
 # =============================================================================
@@ -690,52 +773,20 @@ class ActionSpaceConfig:
         return None
 
 
-# Basic action space (original - movement only)
+# Basic action space (movement only, no gamepad)
 ACTION_SPACE_BASIC = ActionSpaceConfig(
     name="basic",
     description="Basic WASD movement only (9 actions)",
-    actions=[
-        ActionDefinition(0, "W", ActionCategory.MOVEMENT, "W"),
-        ActionDefinition(1, "S", ActionCategory.MOVEMENT, "S"),
-        ActionDefinition(2, "A", ActionCategory.MOVEMENT, "A"),
-        ActionDefinition(3, "D", ActionCategory.MOVEMENT, "D"),
-        ActionDefinition(4, "WA", ActionCategory.MOVEMENT, "W+A"),
-        ActionDefinition(5, "WD", ActionCategory.MOVEMENT, "W+D"),
-        ActionDefinition(6, "SA", ActionCategory.MOVEMENT, "S+A"),
-        ActionDefinition(7, "SD", ActionCategory.MOVEMENT, "S+D"),
-        ActionDefinition(8, "NOKEY", ActionCategory.MOVEMENT, None),
-    ],
-    output_type="single",
+    actions=list(KEYBOARD_BASE_ACTIONS),
+    output_type="multi",
 )
 
-# Standard action space (29 actions - current default)
+# Standard action space (29 actions - current pipeline default)
 ACTION_SPACE_STANDARD = ActionSpaceConfig(
     name="standard",
     description="Standard keyboard + gamepad (29 actions)",
-    actions=MOVEMENT_ACTIONS[:9]
-    + [  # Basic movement
-        ActionDefinition(9, "gamepad_lt", ActionCategory.COMBAT, None, "LT", True),
-        ActionDefinition(10, "gamepad_rt", ActionCategory.COMBAT, None, "RT", True),
-        ActionDefinition(11, "gamepad_lx", ActionCategory.MOVEMENT, None, "Lx", True),
-        ActionDefinition(12, "gamepad_ly", ActionCategory.MOVEMENT, None, "Ly", True),
-        ActionDefinition(13, "gamepad_rx", ActionCategory.CAMERA, None, "Rx", True),
-        ActionDefinition(14, "gamepad_ry", ActionCategory.CAMERA, None, "Ry", True),
-        ActionDefinition(15, "gamepad_up", ActionCategory.UI, None, "UP"),
-        ActionDefinition(16, "gamepad_down", ActionCategory.UI, None, "DOWN"),
-        ActionDefinition(17, "gamepad_left", ActionCategory.UI, None, "LEFT"),
-        ActionDefinition(18, "gamepad_right", ActionCategory.UI, None, "RIGHT"),
-        ActionDefinition(19, "gamepad_start", ActionCategory.UI, None, "START"),
-        ActionDefinition(20, "gamepad_select", ActionCategory.UI, None, "SELECT"),
-        ActionDefinition(21, "gamepad_l3", ActionCategory.MOVEMENT, None, "L3"),
-        ActionDefinition(22, "gamepad_r3", ActionCategory.CAMERA, None, "R3"),
-        ActionDefinition(23, "gamepad_lb", ActionCategory.SKILLS, None, "LB"),
-        ActionDefinition(24, "gamepad_rb", ActionCategory.SKILLS, None, "RB"),
-        ActionDefinition(25, "gamepad_a", ActionCategory.COMBAT, None, "A"),
-        ActionDefinition(26, "gamepad_b", ActionCategory.COMBAT, None, "B"),
-        ActionDefinition(27, "gamepad_x", ActionCategory.SKILLS, None, "X"),
-        ActionDefinition(28, "gamepad_y", ActionCategory.SKILLS, None, "Y"),
-    ],
-    output_type="single",
+    actions=list(KEYBOARD_BASE_ACTIONS) + list(_STANDARD_GAMEPAD_ACTIONS),
+    output_type="multi",
 )
 
 # Extended action space (73 actions - full MMORPG)
@@ -776,10 +827,104 @@ ACTION_SPACES: Dict[str, ActionSpaceConfig] = {
     "combat": ACTION_SPACE_COMBAT,
 }
 
+#: The action space the training and inference pipeline uses unless a caller
+#: explicitly asks for another one. Checkpoints are trained against this
+#: layout, so changing it invalidates existing models.
+DEFAULT_ACTION_SPACE_NAME = "standard"
 
-def get_action_space(name: str = "standard") -> ActionSpaceConfig:
+
+def validate_action_spaces() -> List[str]:
+    """Check the built-in action spaces for structural mistakes.
+
+    Returns a list of human-readable problem descriptions (empty when clean).
+    Called once at import time so a bad edit fails loudly and immediately
+    instead of silently shifting every action index by one.
+
+    Verifies that, for each space:
+      * action ids are contiguous and match their position in the list
+        (``decode_actions_multi_label`` and ``get_action_by_id`` would
+        otherwise disagree about which output slot an action belongs to);
+      * action names are unique;
+      * the space uses multi-label output, matching the BCEWithLogitsLoss
+        objective used by ``train_model.py``.
+    """
+    problems: List[str] = []
+
+    for name, space in ACTION_SPACES.items():
+        for position, action in enumerate(space.actions):
+            if action.id != position:
+                problems.append(
+                    f"{name}: action {action.name!r} has id {action.id} "
+                    f"but sits at position {position}"
+                )
+
+        names = [action.name for action in space.actions]
+        duplicates = {n for n in names if names.count(n) > 1}
+        if duplicates:
+            problems.append(f"{name}: duplicate action names {sorted(duplicates)}")
+
+        if space.output_type != "multi":
+            problems.append(
+                f"{name}: output_type is {space.output_type!r} but the pipeline "
+                f"trains with BCEWithLogitsLoss (multi-label sigmoid)"
+            )
+
+    # The keyboard base slots are shared by the recorder and the executor; if
+    # their length drifts, recorded data and inference disagree silently.
+    if len(KEYBOARD_BASE_ACTIONS) + len(_STANDARD_GAMEPAD_ACTIONS) != 29:
+        problems.append(
+            "standard space is no longer 29 actions "
+            f"(got {len(KEYBOARD_BASE_ACTIONS) + len(_STANDARD_GAMEPAD_ACTIONS)})"
+        )
+    if KEYBOARD_BASE_ACTIONS[NO_KEY_ACTION_ID].name != NO_KEY_ACTION.name:
+        problems.append(
+            f"slot {NO_KEY_ACTION_ID} must be the idle sentinel "
+            f"{NO_KEY_ACTION.name!r}, got "
+            f"{KEYBOARD_BASE_ACTIONS[NO_KEY_ACTION_ID].name!r}"
+        )
+
+    return problems
+
+
+_ACTION_SPACE_PROBLEMS = validate_action_spaces()
+if _ACTION_SPACE_PROBLEMS:  # pragma: no cover - import-time guard
+    raise ValueError(
+        "Invalid action space configuration in bot_mmorpg.config.action_mapping:\n  - "
+        + "\n  - ".join(_ACTION_SPACE_PROBLEMS)
+    )
+
+
+def get_action_space(name: str = DEFAULT_ACTION_SPACE_NAME) -> ActionSpaceConfig:
     """Get action space configuration by name."""
-    return ACTION_SPACES.get(name.lower(), ACTION_SPACE_STANDARD)
+    return ACTION_SPACES.get(name.lower(), ACTION_SPACES[DEFAULT_ACTION_SPACE_NAME])
+
+
+#: Action spaces the collect/train/inference pipeline can actually execute.
+#: ``combat`` and ``extended`` define skill, targeting and UI bindings for which
+#: ``test_model.execute_action`` has no handlers, so a model routed through them
+#: would emit actions that silently do nothing.
+PIPELINE_SUPPORTED_SPACES = ("basic", "standard")
+
+
+def get_pipeline_action_space(
+    name: str = DEFAULT_ACTION_SPACE_NAME,
+) -> ActionSpaceConfig:
+    """Resolve an action space for use by the runtime pipeline.
+
+    Unlike :func:`get_action_space`, this never returns a space the pipeline
+    cannot execute: an unsupported-but-existing name falls back to the default
+    space instead of yielding a model whose actions go nowhere. The caller can
+    detect the substitution with :func:`is_pipeline_supported`.
+    """
+    space = get_action_space(name)
+    if space.name not in PIPELINE_SUPPORTED_SPACES:
+        return ACTION_SPACES[DEFAULT_ACTION_SPACE_NAME]
+    return space
+
+
+def is_pipeline_supported(name: str) -> bool:
+    """Whether the runtime pipeline can execute the named action space."""
+    return get_action_space(name).name in PIPELINE_SUPPORTED_SPACES
 
 
 def list_action_spaces() -> List[str]:
@@ -842,6 +987,10 @@ def decode_actions_multi_label(
 # =============================================================================
 # Game-Specific Presets
 # =============================================================================
+# These record the action space each game *would* ideally use. Only "standard"
+# is executable today (see PIPELINE_SUPPORTED_SPACES), so profile loading
+# resolves through get_pipeline_action_space() and falls back rather than
+# handing the pipeline a space it cannot drive.
 
 GAME_ACTION_PRESETS: Dict[str, str] = {
     # Action MMORPGs - need full skill bars
@@ -880,20 +1029,23 @@ ACTION_SPACE_TABLE = """
 ╠═══════════════════╦════════════╦═════════════════════════════════════════════╣
 ║ Name              ║ Actions    ║ Description                                  ║
 ╠═══════════════════╬════════════╬═════════════════════════════════════════════╣
-║ basic             ║ 9          ║ WASD movement only (original)                ║
-║ standard          ║ 29         ║ Keyboard + full gamepad                      ║
+║ basic             ║ 9          ║ WASD movement only (no gamepad)              ║
+║ standard          ║ 29         ║ Keyboard + full gamepad  ← pipeline default  ║
 ║ combat            ║ 48         ║ Movement + skills + combat (action RPGs)     ║
 ║ extended          ║ 73         ║ Full MMORPG (movement, skills, UI, camera)   ║
 ╚═══════════════════╩════════════╩═════════════════════════════════════════════╝
 
-Output Types:
-- single: One action at a time (softmax) - good for simple routing
-- multi: Multiple simultaneous actions (sigmoid) - good for combat
+Output Type:
+- every space is multi-label (sigmoid) because train_model.py optimises
+  BCEWithLogitsLoss, so simultaneous inputs ("W + strafe + click") are learnable
 
-Game Recommendations:
-- Genshin Impact, Lost Ark, BDO: combat (48 actions, multi-label)
-- WoW, FFXIV: extended (73 actions, multi-label)
-- RuneScape, Albion: standard (29 actions, single-label)
+Slots 0-8 are the shared keyboard layout and must stay stable:
+  0 W        1 S        2 A        3 D
+  4 W+A      5 W+D      6 S+A      7 S+D
+  8 nokeys  (idle sentinel -- NOT jump)
+
+Slots 9-28 are gamepad, then 6 mouse values are appended when mouse capture
+is enabled (35 total).
 """
 
 
