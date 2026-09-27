@@ -20,7 +20,7 @@ Output Design:
 
 from dataclasses import dataclass, replace
 from enum import Enum, auto
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 
 class ActionCategory(Enum):
@@ -737,11 +737,115 @@ _STANDARD_GAMEPAD_ACTIONS: List[ActionDefinition] = [
     ActionDefinition(28, "gamepad_y", ActionCategory.SKILLS, None, "Y"),
 ]
 
+# =============================================================================
+# Mouse block
+# =============================================================================
 #: Mouse slots appended after the discrete actions when a model is trained with
-#: mouse capture enabled. ``collect_data`` writes the 6-value legacy layout
-#: (``mouse_state.to_array()``), so that is the shape the pipeline produces.
-MOUSE_OUTPUT_SIZE = 6
+#: mouse capture enabled. ``collect_data`` writes ``mouse_state.to_array()``,
+#: whose layout :data:`MOUSE_FIELDS` mirrors -- keep the two in sync.
+#:
+#: Five of the ten fields are signed. Mouse capture normalises deltas and
+#: velocities to [-1, 1] and records scroll as a signed step count, but the
+#: training loss (``nn.BCEWithLogitsLoss``) can only represent a target in
+#: [0, 1]. A negative target is unreachable for that loss, so it does not
+#: converge: the gradient drives the logit towards -inf and the field collapses
+#: to 0, which inference then reads as "full left" rather than "no movement".
+#:
+#: Recording therefore stores signed fields mapped through ``(v + 1) / 2``, and
+#: inference inverts them with ``(p - 0.5) * 2`` -- the transform
+#: ``InferenceEngine.execute_mouse`` already performs.
+MOUSE_OUTPUT_SIZE = 10
 MOUSE_ACTION_ID = 72  # first mouse slot == len(KEYBOARD_BASE_ACTIONS) + 20
+
+
+@dataclass(frozen=True)
+class MouseField:
+    """One slot of the recorded mouse block.
+
+    Attributes:
+        index: Position inside the mouse block, appended after the discrete slots.
+        name: Label used in logs and validation errors.
+        signed: True when the raw capture value can go negative and therefore has
+            to be mapped into [0, 1] before it reaches a BCE loss.
+        description: What the raw capture value means.
+    """
+
+    index: int
+    name: str
+    signed: bool
+    description: str
+
+
+MOUSE_FIELDS: Tuple[MouseField, ...] = (
+    MouseField(0, "x", False, "absolute position, fraction of the capture region"),
+    MouseField(1, "y", False, "absolute position, fraction of the capture region"),
+    MouseField(2, "dx", True, "frame delta, fraction of the capture region width"),
+    MouseField(3, "dy", True, "frame delta, fraction of the capture region height"),
+    MouseField(4, "vx", True, "velocity, fraction of mouse_capture._MAX_VELOCITY"),
+    MouseField(5, "vy", True, "velocity, fraction of mouse_capture._MAX_VELOCITY"),
+    MouseField(6, "lmb", False, "left button held"),
+    MouseField(7, "rmb", False, "right button held"),
+    MouseField(8, "mmb", False, "middle button held"),
+    MouseField(9, "scroll", True, "signed scroll step count"),
+)
+
+#: Number of signed fields, i.e. the ones a BCE loss cannot represent raw.
+MOUSE_SIGNED_FIELD_COUNT = sum(1 for f in MOUSE_FIELDS if f.signed)
+
+
+def mouse_field(name: str) -> MouseField:
+    """Look a mouse field up by name.
+
+    Raises:
+        KeyError: If no field carries that name.
+    """
+    for field in MOUSE_FIELDS:
+        if field.name == name:
+            return field
+    raise KeyError(name)
+
+
+def normalize_mouse_vector(values) -> List[float]:
+    """Map a raw mouse capture block into the [0, 1] targets the loss expects.
+
+    Unsigned fields pass through untouched; signed fields are mapped through
+    ``(v + 1) / 2``. Callers that need an array should wrap the result in
+    ``numpy.asarray`` so the dtype stays float32.
+
+    Args:
+        values: Raw values in ``mouse_capture.MouseState.to_array()`` order.
+
+    Returns:
+        A new list of ``MOUSE_OUTPUT_SIZE`` floats.
+
+    Raises:
+        ValueError: If the vector length does not match ``MOUSE_OUTPUT_SIZE``.
+    """
+    if len(values) != MOUSE_OUTPUT_SIZE:
+        raise ValueError(
+            "Expected %d mouse values, got %d" % (MOUSE_OUTPUT_SIZE, len(values))
+        )
+
+    scaled = [float(v) for v in values]
+    for field in MOUSE_FIELDS:
+        if field.signed:
+            scaled[field.index] = scaled[field.index] * 0.5 + 0.5
+    return scaled
+
+
+def denormalize_mouse_value(field: MouseField, value: float) -> float:
+    """Inverse of :func:`normalize_mouse_vector` for a single field.
+
+    Args:
+        field: The field the prediction belongs to.
+        value: Raw model output for that field, in [0, 1].
+
+    Returns:
+        The signed value for signed fields, otherwise the value unchanged.
+    """
+    if field.signed:
+        return (float(value) - 0.5) * 2.0
+    return float(value)
 
 
 # =============================================================================

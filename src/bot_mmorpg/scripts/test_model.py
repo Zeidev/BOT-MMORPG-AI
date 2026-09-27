@@ -167,38 +167,65 @@ except ImportError:
 # Action space definition -- single source of truth for action indices.
 # Without this the module would fall back to hardcoded literals and drift from
 # bot_mmorpg.config.action_mapping.
-ACTION_SPACE = None
-MOUSE_OUTPUT_SIZE = 6
-try:
-    from ..config.action_mapping import (
-        DEFAULT_ACTION_SPACE_NAME,
-        get_pipeline_action_space,
-    )
+# Action space definition -- single source of truth for action indices.
+# Without this the module would fall back to hardcoded literals and drift from
+# bot_mmorpg.config.action_mapping.
 
-    ACTION_SPACE = get_pipeline_action_space(DEFAULT_ACTION_SPACE_NAME)
-except ImportError:  # pragma: no cover - exercised only when run as a script
+
+def _resolve_action_mapping():
+    """Return the action_mapping module, whichever way this file was started.
+
+    ``test_model.py`` runs both as ``bot-mmorpg-play`` and as a bare script, so
+    the same module is reachable under two names. Returns ``None`` when neither
+    resolves, which leaves this file importable with degraded action metadata
+    instead of failing at import time.
+    """
     try:
-        from config.action_mapping import (
-            DEFAULT_ACTION_SPACE_NAME,
-            get_pipeline_action_space,
-        )
+        from ..config import action_mapping as resolved
 
-        ACTION_SPACE = get_pipeline_action_space(DEFAULT_ACTION_SPACE_NAME)
+        return resolved
+    except ImportError:  # pragma: no cover - exercised only when run as a script
+        pass
+
+    try:
+        from config import action_mapping as resolved
+
+        return resolved
     except ImportError:
-        try:
-            # Direct script execution: put the package root on sys.path so the
-            # sibling "config" package resolves.
-            _pkg_root = Path(__file__).resolve().parent.parent
-            if str(_pkg_root) not in sys.path:
-                sys.path.insert(0, str(_pkg_root))
-            from config.action_mapping import (
-                DEFAULT_ACTION_SPACE_NAME,
-                get_pipeline_action_space,
-            )
+        pass
 
-            ACTION_SPACE = get_pipeline_action_space(DEFAULT_ACTION_SPACE_NAME)
-        except ImportError:
-            ACTION_SPACE = None
+    # Direct script execution: put the package root on sys.path so the sibling
+    # "config" package resolves.
+    pkg_root = Path(__file__).resolve().parent.parent
+    if str(pkg_root) not in sys.path:
+        sys.path.insert(0, str(pkg_root))
+    try:
+        from config import action_mapping as resolved
+
+        return resolved
+    except ImportError:
+        return None
+
+
+_ACTION_MAPPING = _resolve_action_mapping()
+
+if _ACTION_MAPPING is not None:
+    ACTION_SPACE = _ACTION_MAPPING.get_pipeline_action_space(
+        _ACTION_MAPPING.DEFAULT_ACTION_SPACE_NAME
+    )
+    # Recorded mouse block, in mouse_capture.MouseState.to_array() order.
+    MOUSE_FIELDS = _ACTION_MAPPING.MOUSE_FIELDS
+    MOUSE_OUTPUT_SIZE = _ACTION_MAPPING.MOUSE_OUTPUT_SIZE
+    _DENORMALIZE_MOUSE = _ACTION_MAPPING.denormalize_mouse_value
+else:  # pragma: no cover - only when the config package is unreachable
+    ACTION_SPACE = None
+    MOUSE_FIELDS = ()
+    MOUSE_OUTPUT_SIZE = 0
+    _DENORMALIZE_MOUSE = None
+
+#: Mouse field by name, so ``execute_mouse`` reads a slot through its name
+#: rather than a magic index that a reordered block would silently invalidate.
+_MOUSE_FIELD = {field.name: field for field in MOUSE_FIELDS}
 
 # Platform-specific imports
 IS_WINDOWS = platform.system() == "Windows"
@@ -278,13 +305,23 @@ if len(_BASE_ACTION_WEIGHTS) != _BASE_ACTION_COUNT:  # pragma: no cover
         f"defines {_BASE_ACTION_COUNT} discrete actions"
     )
 
-# Mouse weight block: [x, y, dx, dy, vx, vy, lmb, rmb, mmb, scroll]
+# Mouse weight block, in the same order as config.action_mapping.MOUSE_FIELDS:
+# [x, y, dx, dy, vx, vy, lmb, rmb, mmb, scroll]
 # Position/delta/velocity are continuous outputs (not chosen via argmax),
 # so their weights are low to avoid competing with discrete actions.
 _MOUSE_WEIGHTS_10 = np.array([0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 1.0, 1.0, 0.8, 0.3])
 
 # Legacy 6-value mouse: [x, y, lmb, rmb, mmb, scroll]
+_LEGACY_MOUSE_OUTPUT_SIZE = 6
 _MOUSE_WEIGHTS_6 = np.array([0.1, 0.1, 1.0, 1.0, 0.8, 0.3])
+
+if MOUSE_OUTPUT_SIZE and len(_MOUSE_WEIGHTS_10) != MOUSE_OUTPUT_SIZE:
+    # pragma: no cover - guards a reordering of MOUSE_FIELDS against these
+    # positional weights, which would silently reweight the wrong outputs.
+    raise ValueError(
+        f"_MOUSE_WEIGHTS_10 has {len(_MOUSE_WEIGHTS_10)} entries but the action "
+        f"space records a {MOUSE_OUTPUT_SIZE}-value mouse block"
+    )
 
 
 def build_action_weights(num_actions: int) -> np.ndarray:
@@ -296,9 +333,9 @@ def build_action_weights(num_actions: int) -> np.ndarray:
         return _BASE_ACTION_WEIGHTS[:num_actions].copy()
 
     mouse_size = num_actions - _BASE_ACTION_COUNT
-    if mouse_size == 10:
+    if mouse_size == MOUSE_OUTPUT_SIZE:
         mouse_w = _MOUSE_WEIGHTS_10
-    elif mouse_size == 6:
+    elif mouse_size == _LEGACY_MOUSE_OUTPUT_SIZE:
         mouse_w = _MOUSE_WEIGHTS_6
     else:
         # Unknown mouse format – equal weight
@@ -854,47 +891,51 @@ class InferenceEngine:
     def execute_mouse(self, predictions: np.ndarray):
         """Execute mouse actions from model predictions (optional, additive).
 
-        Only called when ``self.has_mouse_output`` is True.
-        Uses delta movement (dx, dy) for smooth camera control via
-        linear interpolation, and handles click predictions.
+                Only called when ``self.has_mouse_output`` is True.
+                Uses delta movement (dx, dy) for smooth camera control via
+                linear interpolation, and handles click predictions.
 
-        The mouse values live at prediction indices [29:].
-        10-value format: [x, y, dx, dy, vx, vy, lmb, rmb, mmb, scroll]
-         6-value format: [x, y, lmb, rmb, mmb, scroll]
+        The mouse values follow the discrete slots, and each one is read by name
+                through ``config.action_mapping.MOUSE_FIELDS``, so reordering that
+                block cannot silently swap dx with dy. Signed fields (dx, dy, vx, vy,
+                scroll) are recorded as ``(v + 1) / 2`` and mapped back here.
+
+                Legacy 6-value checkpoints (x, y, lmb, rmb, mmb, scroll) carry no
+                delta, so camera movement is skipped for them.
         """
         if not MOUSE_OUTPUT_AVAILABLE or _MOUSE_CTRL is None:
             return
 
-        mouse_preds = predictions[29:]
-        if len(mouse_preds) == 0:
+        if _DENORMALIZE_MOUSE is None:  # pragma: no cover
+            # Without the field table there is no safe way to tell which slot
+            # holds which mouse value, so decline rather than guess.
             return
 
-        if len(mouse_preds) >= 10:
-            # 10-value format: prefer delta for camera (smoother than absolute)
-            dx, dy = mouse_preds[2], mouse_preds[3]
-            lmb_prob, rmb_prob, _mmb_prob = (
-                mouse_preds[6],
-                mouse_preds[7],
-                mouse_preds[8],
-            )
-            scroll_val = mouse_preds[9]
-        elif len(mouse_preds) >= 6:
-            # Legacy 6-value: no delta available, skip movement
-            dx, dy = 0.0, 0.0
-            lmb_prob, rmb_prob, _mmb_prob = (
-                mouse_preds[2],
-                mouse_preds[3],
-                mouse_preds[4],
-            )
+        mouse_preds = predictions[_BASE_ACTION_COUNT:]
+        if len(mouse_preds) >= MOUSE_OUTPUT_SIZE:
+            # Current format: prefer the recorded delta for the camera, which
+            # is smoother than moving to the absolute cursor position.
+            dx = mouse_preds[_MOUSE_FIELD["dx"].index]
+            dy = mouse_preds[_MOUSE_FIELD["dy"].index]
+            lmb_prob = mouse_preds[_MOUSE_FIELD["lmb"].index]
+            rmb_prob = mouse_preds[_MOUSE_FIELD["rmb"].index]
+            scroll_val = mouse_preds[_MOUSE_FIELD["scroll"].index]
+        elif len(mouse_preds) >= _LEGACY_MOUSE_OUTPUT_SIZE:
+            # Legacy 6-value: no delta was recorded, so drive the camera to a
+            # remapped zero instead of pretending the delta was "full left".
+            dx = dy = 0.5
+            lmb_prob = mouse_preds[2]
+            rmb_prob = mouse_preds[3]
             scroll_val = mouse_preds[5]
         else:
             return
 
         # ── Smooth mouse movement via delta ──
-        # dx/dy are sigmoid outputs in [0,1]; remap to [-1,1] then scale to pixels
-        # The model learned normalized deltas: -1 = full left, +1 = full right
-        dx_remapped = (dx - 0.5) * 2.0  # [0,1] → [-1,1]
-        dy_remapped = (dy - 0.5) * 2.0
+        # dx/dy are sigmoid outputs in [0,1]; the recorder mapped the signed range
+        # through (v + 1) / 2, so invert it to recover [-1,1] and scale to
+        # pixels. A remapped 0 means "no movement", 1 means "full right".
+        dx_remapped = _DENORMALIZE_MOUSE(_MOUSE_FIELD["dx"], dx)
+        dy_remapped = _DENORMALIZE_MOUSE(_MOUSE_FIELD["dy"], dy)
         # Scale: max ~100px per frame for smooth camera
         pixel_dx = int(dx_remapped * 100)
         pixel_dy = int(dy_remapped * 100)
@@ -914,7 +955,7 @@ class InferenceEngine:
             _MOUSE_CTRL.release(_MBtn.right)
 
         # ── Scroll ──
-        scroll_remapped = (scroll_val - 0.5) * 2.0
+        scroll_remapped = _DENORMALIZE_MOUSE(_MOUSE_FIELD["scroll"], scroll_val)
         if abs(scroll_remapped) > 0.3:
             _MOUSE_CTRL.scroll(0, int(scroll_remapped * 3))
 

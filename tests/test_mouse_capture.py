@@ -200,16 +200,18 @@ class TestMouseCaptureButtons:
 
     def test_scroll_accumulation(self):
         """Test scroll delta accumulates and resets per snapshot."""
+        from bot_mmorpg.scripts import mouse_capture
         from bot_mmorpg.scripts.mouse_capture import MouseCapture
 
         mc = MouseCapture()
 
-        # Simulate scroll events
+        # Half of full scale, so the normalisation by _MAX_SCROLL_STEPS is
+        # visible without landing on the clamp.
         with mc._state.lock:
-            mc._state.scroll_accum = 3.0
+            mc._state.scroll_accum = mouse_capture._MAX_SCROLL_STEPS / 2
 
         state1 = mc.snapshot()
-        assert state1.scroll == 3.0
+        assert state1.scroll == 0.5
 
         # Scroll should be reset after snapshot
         state2 = mc.snapshot()
@@ -217,15 +219,30 @@ class TestMouseCaptureButtons:
 
     def test_negative_scroll(self):
         """Test negative scroll (scroll down)."""
+        from bot_mmorpg.scripts import mouse_capture
         from bot_mmorpg.scripts.mouse_capture import MouseCapture
 
         mc = MouseCapture()
 
         with mc._state.lock:
-            mc._state.scroll_accum = -5.0
+            mc._state.scroll_accum = -mouse_capture._MAX_SCROLL_STEPS / 2
 
         state = mc.snapshot()
-        assert state.scroll == -5.0
+        assert state.scroll == -0.5
+
+    def test_scroll_beyond_full_scale_is_clamped(self):
+        """A fast wheel flick sends more steps than one frame can express,
+        so snapshot() has to bound it. Without the clamp the recorded block
+        leaves the [0, 1] range the rest of the pipeline assumes.
+        """
+        from bot_mmorpg.scripts.mouse_capture import MouseCapture
+
+        mc = MouseCapture()
+
+        for accum, expected in ((50.0, 1.0), (-50.0, -1.0)):
+            with mc._state.lock:
+                mc._state.scroll_accum = accum
+            assert mc.snapshot().scroll == expected
 
 
 class TestMouseCaptureThreadSafety:

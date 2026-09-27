@@ -22,7 +22,7 @@ display:
 # The action vector is fixed by the pipeline, not by this game:
 #   slots  0-8   keyboard  (W, S, A, D, WA, WD, SA, SD, no_keys)
 #   slots  9-28  gamepad   (10 implemented, 10 reported as unmapped)
-#   slots 29-34  mouse     (x, y, lmb, rmb, mmb, scroll) -- only with --mouse
+#   slots 29-38  mouse     (x, y, dx, dy, vx, vy, lmb, rmb, mmb, scroll) -- only with --mouse
 #
 # Frames are captured and fed to the network at 480x270. Both collect_data.py
 # and test_model.py hardcode that size and train_model.py does not rescale,
@@ -34,7 +34,7 @@ display:
 # ---------------------------------------------------------------------------
 input:
   action_space: "standard"
-  num_actions: 29  # 9 keyboard + 20 gamepad (35 with --mouse)
+  num_actions: 29  # 9 keyboard + 20 gamepad (39 with --mouse)
   requires_mouse: true
   mouse_precision: "high"
   default_bindings:

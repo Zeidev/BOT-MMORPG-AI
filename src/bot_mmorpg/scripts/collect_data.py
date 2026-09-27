@@ -63,27 +63,33 @@ DEFAULT_TARGET_SIZE = (480, 270)
 
 #: Used only when the config package cannot be imported at all.
 _FALLBACK_BASE_ACTIONS = 29
-_FALLBACK_MOUSE_ACTIONS = 6
+_FALLBACK_MOUSE_ACTIONS = 10
 
 
 def _load_action_space():
     """Resolve the shared action space through every import path this script has.
 
     Returns:
-        Tuple of (action_space or None, mouse_output_size)
+        Tuple of (action_space or None, mouse_output_size, mouse_fields,
+        normalize_mouse_vector or None). The last two are empty only in the
+        built-in fallback, where there is no field table to normalise against.
     """
     try:
         from ..config.action_mapping import (  # normal package import
             DEFAULT_ACTION_SPACE_NAME,
+            MOUSE_FIELDS,
             MOUSE_OUTPUT_SIZE,
             get_pipeline_action_space,
+            normalize_mouse_vector,
         )
     except ImportError:  # pragma: no cover - exercised only when run as a script
         try:
             from config.action_mapping import (
                 DEFAULT_ACTION_SPACE_NAME,
+                MOUSE_FIELDS,
                 MOUSE_OUTPUT_SIZE,
                 get_pipeline_action_space,
+                normalize_mouse_vector,
             )
         except ImportError:
             try:
@@ -95,8 +101,10 @@ def _load_action_space():
                     _sys.path.insert(0, str(_pkg_root))
                 from config.action_mapping import (
                     DEFAULT_ACTION_SPACE_NAME,
+                    MOUSE_FIELDS,
                     MOUSE_OUTPUT_SIZE,
                     get_pipeline_action_space,
+                    normalize_mouse_vector,
                 )
             except ImportError:
                 logger.warning(
@@ -105,13 +113,18 @@ def _load_action_space():
                     "Slot order stays identical, but the action space is no "
                     "longer validated at import time."
                 )
-                return None, _FALLBACK_MOUSE_ACTIONS
+                return None, _FALLBACK_MOUSE_ACTIONS, (), None
 
-    return get_pipeline_action_space(DEFAULT_ACTION_SPACE_NAME), MOUSE_OUTPUT_SIZE
+    return (
+        get_pipeline_action_space(DEFAULT_ACTION_SPACE_NAME),
+        MOUSE_OUTPUT_SIZE,
+        MOUSE_FIELDS,
+        normalize_mouse_vector,
+    )
 
 
 # Action space definition -- single source of truth for keyboard slot order.
-ACTION_SPACE, MOUSE_OUTPUT_SIZE = _load_action_space()
+ACTION_SPACE, MOUSE_OUTPUT_SIZE, MOUSE_FIELDS, _NORMALIZE_MOUSE = _load_action_space()
 
 #: Number of keyboard slots at the head of the action space.
 _KEYBOARD_SLOT_COUNT = 9
@@ -364,8 +377,10 @@ def capture_input(
     Mouse recording is additive and non-destructive:
     - When *mouse_capturer* is ``None`` the returned mouse vector is ``None``
       and the existing keyboard+gamepad values are unchanged.
-    - When a :class:`MouseCapture` instance is provided, a 6-element float32
-      array ``[x, y, lmb, rmb, mmb, scroll]`` is appended.
+    - When a :class:`MouseCapture` instance is provided, its
+      ``MOUSE_OUTPUT_SIZE``-element float32 snapshot is appended, with the
+      signed fields mapped into ``[0, 1]`` so the BCE loss can represent them.
+      ``InferenceEngine.execute_mouse`` inverts that mapping at playback time.
 
     Args:
         mouse_capturer: Optional MouseCapture instance (or None to skip).
@@ -396,10 +411,20 @@ def capture_input(
         if mouse_capturer is not None:
             try:
                 state = mouse_capturer.snapshot()
-                mouse_output = state.to_array()  # float32, shape (6,)
-            except Exception:
-                # Mouse capture failure must never break recording
+                # Signed fields are mapped into [0, 1] here so the BCE loss
+                # can actually represent them; execute_mouse inverts this
+                # at playback time.
+                mouse_output = np.asarray(
+                    _NORMALIZE_MOUSE(state.to_array()),
+                    dtype=np.float32,
+                )
+            except Exception as exc:
+                # Mouse capture failure must never break recording -- but it
+                # must not be silent either. A dropped block is
+                # indistinguishable from a bot that simply has no mouse, and
+                # the dataset looks fine until training collapses.
                 mouse_output = None
+                logger.warning(f"Mouse capture failed, recording without it: {exc}")
 
         return keyboard_output, gamepad_output, mouse_output
 
@@ -697,7 +722,8 @@ Example:
             mouse_capturer = MouseCapture(capture_region=region)
             mouse_capturer.start()
             logger.info(
-                "Mouse recording ENABLED (adds 6 values: x, y, lmb, rmb, mmb, scroll)"
+                f"Mouse recording ENABLED (adds {MOUSE_OUTPUT_SIZE} values: "
+                f"{', '.join(f.name for f in MOUSE_FIELDS)})"
             )
 
     # Countdown

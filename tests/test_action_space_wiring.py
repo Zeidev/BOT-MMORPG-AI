@@ -156,7 +156,7 @@ class TestActionSpaceLayout:
     def test_mouse_output_size(self):
         from bot_mmorpg.config.action_mapping import MOUSE_OUTPUT_SIZE
 
-        assert MOUSE_OUTPUT_SIZE == 6
+        assert MOUSE_OUTPUT_SIZE == 10
 
     def test_movement_actions_list_untouched(self):
         """MOVEMENT_ACTIONS still carries the original 'jump' at slot 8; the
@@ -187,7 +187,7 @@ class TestCollectDataWiring:
 
         assert collect_data.base_action_count() == 29
         assert collect_data.expected_action_width(False) == 29
-        assert collect_data.expected_action_width(True) == 35
+        assert collect_data.expected_action_width(True) == 39
 
     def test_describe_action_space_mentions_every_part(self):
         from bot_mmorpg.scripts import collect_data
@@ -196,7 +196,7 @@ class TestCollectDataWiring:
         assert "29 actions" in text
         assert "9 keyboard" in text
         assert "20 gamepad" in text
-        assert "6 mouse" in text
+        assert "10 mouse" in text
 
     def test_capture_screen_default_matches_the_pipeline(self):
         """test_model.py resizes frames to 480x270 and train_model.py never
@@ -272,6 +272,248 @@ class TestCollectDataWiring:
 
 
 # =============================================================================
+# Mouse block
+# =============================================================================
+
+
+class TestMouseBlock:
+    """The recorded mouse slots and the [0, 1] range they are stored in.
+
+    The block used to be six values (x, y, lmb, rmb, mmb, scroll) written raw.
+    Five of the ten values can be negative, and the training loss is
+    nn.BCEWithLogitsLoss, which cannot represent a target below zero: a negative
+    target drives the logit towards -inf and the field collapses to 0, which
+    inference then reads as "full left" rather than "no movement". Recording
+    therefore stores signed fields mapped through ``(v + 1) / 2``.
+    """
+
+    def test_block_has_ten_sequentially_indexed_slots(self):
+        from bot_mmorpg.config.action_mapping import MOUSE_FIELDS, MOUSE_OUTPUT_SIZE
+
+        assert MOUSE_OUTPUT_SIZE == 10
+        assert len(MOUSE_FIELDS) == MOUSE_OUTPUT_SIZE
+        assert [f.index for f in MOUSE_FIELDS] == list(range(MOUSE_OUTPUT_SIZE))
+
+    def test_slot_order_matches_the_recorder(self):
+        """collect_data appends mouse_state.to_array() verbatim, so the field
+        table and the serializer have to agree slot for slot. Each slot gets a
+        distinct value, so a reordering in either place cannot pass by luck."""
+        from dataclasses import replace
+
+        from bot_mmorpg.config.action_mapping import MOUSE_FIELDS
+        from bot_mmorpg.scripts.mouse_capture import MouseState
+
+        state = replace(
+            MouseState(),
+            **{field.name: i / 10.0 for i, field in enumerate(MOUSE_FIELDS)},
+        )
+        assert list(state.to_array()) == pytest.approx([i / 10.0 for i in range(10)])
+
+    def test_signed_fields_are_exactly_the_ones_that_go_negative(self):
+        from bot_mmorpg.config.action_mapping import (
+            MOUSE_FIELDS,
+            MOUSE_SIGNED_FIELD_COUNT,
+        )
+
+        signed = {f.name for f in MOUSE_FIELDS if f.signed}
+        assert signed == {"dx", "dy", "vx", "vy", "scroll"}
+        assert MOUSE_SIGNED_FIELD_COUNT == len(signed) == 5
+
+    def test_normalization_puts_every_field_in_range(self):
+        """BCE cannot represent a negative target, so this is the property
+        that makes the mouse block trainable at all."""
+        from bot_mmorpg.config.action_mapping import (
+            MOUSE_FIELDS,
+            normalize_mouse_vector,
+        )
+
+        raw = [-1.0 if f.signed else 0.5 for f in MOUSE_FIELDS]
+        out = normalize_mouse_vector(raw)
+        assert len(out) == len(MOUSE_FIELDS)
+        assert all(0.0 <= v <= 1.0 for v in out)
+
+    def test_normalization_is_lossless_for_a_real_snapshot(self):
+        """(v + 1) / 2 then (p - 0.5) * 2 has to give the captured value back,
+        or the bot moves the camera by a different amount than the recording."""
+        from bot_mmorpg.config.action_mapping import (
+            MOUSE_FIELDS,
+            denormalize_mouse_value,
+            mouse_field,
+            normalize_mouse_vector,
+        )
+        from bot_mmorpg.scripts.mouse_capture import MouseState
+
+        state = MouseState(
+            x=0.13,
+            y=0.87,
+            dx=-0.4,
+            dy=0.9,
+            vx=0.0,
+            vy=-1.0,
+            lmb=1,
+            rmb=0,
+            mmb=1,
+            scroll=-0.25,
+        )
+        raw = list(state.to_array())
+        normalized = normalize_mouse_vector(raw)
+        restored = [
+            denormalize_mouse_value(mouse_field(field.name), value)
+            for field, value in zip(MOUSE_FIELDS, normalized)
+        ]
+        assert restored == pytest.approx(raw, abs=1e-6)
+
+    def test_neutral_input_becomes_the_neutral_target(self):
+        """A field captured as 0 has to record 0.5, not 0.0. Inference maps 0.5
+        back to 0 and leaves the camera alone; it would read 0.0 as full left."""
+        from bot_mmorpg.config.action_mapping import (
+            denormalize_mouse_value,
+            mouse_field,
+            normalize_mouse_vector,
+        )
+
+        out = normalize_mouse_vector([0.0] * 10)
+        assert out[mouse_field("dx").index] == 0.5
+        assert denormalize_mouse_value(mouse_field("dx"), 0.5) == 0.0
+
+    def test_wrong_length_is_rejected(self):
+        from bot_mmorpg.config.action_mapping import normalize_mouse_vector
+
+        with pytest.raises(ValueError, match="mouse values"):
+            normalize_mouse_vector([0.0] * 6)
+
+    def test_scrollable_fields_stay_in_range_after_capture(self):
+        """scroll_accum is unbounded, so snapshot() has to clamp it; an
+        unclamped value would normalise past 1.0 and become unreachable."""
+        from bot_mmorpg.config.action_mapping import (
+            mouse_field,
+            normalize_mouse_vector,
+        )
+        from bot_mmorpg.scripts import mouse_capture
+
+        mc = mouse_capture.MouseCapture()
+        scroll_idx = mouse_field("scroll").index
+
+        for accum, expected in ((50.0, 1.0), (-50.0, 0.0)):
+            with mc._state.lock:
+                mc._state.scroll_accum = accum
+            out = normalize_mouse_vector(mc.snapshot().to_array())
+            assert all(0.0 <= v <= 1.0 for v in out)
+            assert out[scroll_idx] == pytest.approx(expected)
+
+
+class TestMouseBlockReachesTheBot:
+    """Inference has to read the block the recorder wrote."""
+
+    def test_field_table_is_available_to_the_bot(self):
+        from bot_mmorpg.scripts import test_model
+
+        assert test_model.MOUSE_OUTPUT_SIZE == 10
+        assert {f.name for f in test_model.MOUSE_FIELDS} == {
+            "x",
+            "y",
+            "dx",
+            "dy",
+            "vx",
+            "vy",
+            "lmb",
+            "rmb",
+            "mmb",
+            "scroll",
+        }
+
+    def test_bot_reads_slots_by_name_not_by_index(self):
+        """A hardcoded 2/3/6/9 in the current-format branch would silently
+        read the wrong slot the day MOUSE_FIELDS is reordered. The legacy
+        branch may keep literal indices: that 6-value order is frozen by the
+        checkpoints already written to disk, so a literal is the honest
+        encoding there.
+        """
+        import inspect
+        import re
+
+        from bot_mmorpg.scripts import test_model
+
+        source = inspect.getsource(test_model.InferenceEngine.execute_mouse)
+        current, marker, legacy = source.partition(
+            "elif len(mouse_preds) >= _LEGACY_MOUSE_OUTPUT_SIZE:"
+        )
+        assert marker, "legacy branch marker not found in execute_mouse"
+
+        # Current format: every slot is resolved through the field table.
+        assert "_MOUSE_FIELD[" in current
+        assert not re.search(r"mouse_preds\[\d+\]", current)
+
+        # Legacy format: fixed [x, y, lmb, rmb, mmb, scroll] order.
+        assert sorted(re.findall(r"mouse_preds\[(\d+)\]", legacy)) == ["2", "3", "5"]
+
+    def test_legacy_width_does_not_steer_the_camera(self):
+        """A 6-value checkpoint has no delta, so dx must denormalise to 0.
+        Mapping a placeholder 0.0 would read as full left every frame."""
+        from bot_mmorpg.config.action_mapping import (
+            denormalize_mouse_value,
+            mouse_field,
+        )
+
+        assert denormalize_mouse_value(mouse_field("dx"), 0.5) == 0.0
+        assert denormalize_mouse_value(mouse_field("dy"), 0.5) == 0.0
+
+
+class TestModelHubAcceptsBothWidths:
+    """The catalog tool validates a model against a game blueprint; a model
+    recorded with --mouse is wider than the blueprint declares."""
+
+    @pytest.mark.parametrize("classes", [29, 39])
+    def test_matching_width_is_accepted(self, classes):
+        from modelhub.validator import validate_compatibility
+
+        blueprint = {
+            "id": "genshin_impact",
+            "expected_input_shape": [480, 270, 3],
+            "expected_classes": 29,
+        }
+        profile = {
+            "profile_name": "m",
+            "architecture": "efficientnet_lstm",
+            "input_shape": [480, 270, 3],
+            "classes": classes,
+        }
+        assert validate_compatibility(blueprint, profile)[0] is True
+
+    @pytest.mark.parametrize("classes", [28, 35, 40])
+    def test_other_widths_are_rejected(self, classes):
+        from modelhub.validator import validate_compatibility
+
+        blueprint = {
+            "id": "genshin_impact",
+            "expected_input_shape": [480, 270, 3],
+            "expected_classes": 29,
+        }
+        profile = {
+            "profile_name": "m",
+            "architecture": "efficientnet_lstm",
+            "input_shape": [480, 270, 3],
+            "classes": classes,
+        }
+        ok, message = validate_compatibility(blueprint, profile)
+        assert ok is False
+        assert "Class count mismatch" in message
+
+    def test_modelhub_widths_match_the_pipeline(self):
+        from modelhub.action_space import (
+            ACCEPTED_CLASS_COUNTS,
+            BASE_ACTION_COUNT,
+            MOUSE_OUTPUT_SIZE,
+        )
+        from bot_mmorpg.config.action_mapping import MOUSE_OUTPUT_SIZE as RECORDED
+        from bot_mmorpg.scripts import collect_data
+
+        assert MOUSE_OUTPUT_SIZE == RECORDED
+        assert BASE_ACTION_COUNT == collect_data.base_action_count()
+        assert ACCEPTED_CLASS_COUNTS == (29, 39)
+
+
+# =============================================================================
 # Game profiles
 # =============================================================================
 
@@ -338,9 +580,9 @@ class TestProfileValidation:
     def test_count_including_mouse_passes(self):
         from bot_mmorpg.scripts import collect_data
 
-        collect_data.validate_profile(self._profile(num_actions=35))
+        collect_data.validate_profile(self._profile(num_actions=39))
 
-    @pytest.mark.parametrize("declared", [0, 12, 16, 28, 30, 36, 48, -1])
+    @pytest.mark.parametrize("declared", [0, 12, 16, 28, 30, 35, 36, 38, 40, 48, -1])
     def test_other_counts_are_rejected(self, declared):
         from bot_mmorpg.scripts import collect_data
 
@@ -452,9 +694,27 @@ class TestInferenceMatchesTheActionSpace:
         assert len(test_model._BASE_ACTION_WEIGHTS) == test_model._BASE_ACTION_COUNT
         assert test_model._BASE_ACTION_COUNT == 29
 
-    def test_six_value_mouse_block_matches_the_collector(self):
-        """collect_data appends mouse_state.to_array(): x, y, lmb, rmb, mmb,
-        scroll. The weights have to describe the same six values."""
+    def test_ten_value_mouse_block_matches_the_collector(self):
+        """The weights have to describe the same ten slots the recorder writes,
+        in the same order, or a trained loss is weighted on the wrong output."""
+        from bot_mmorpg.config.action_mapping import MOUSE_FIELDS
+        from bot_mmorpg.scripts import test_model
+
+        assert len(test_model._MOUSE_WEIGHTS_10) == len(MOUSE_FIELDS)
+
+        weights = test_model.build_action_weights(39)
+        assert weights.shape == (39,)
+        # Continuous outputs (position/delta/velocity) must not out-vote the
+        # discrete actions; buttons must.
+        for field in MOUSE_FIELDS:
+            if field.name in ("lmb", "rmb", "mmb"):
+                assert weights[29 + field.index] >= 0.8, field.name
+            elif field.name != "scroll":
+                assert weights[29 + field.index] < 0.5, field.name
+
+    def test_legacy_six_value_mouse_block_still_loads(self):
+        """Checkpoints recorded before the block grew to ten values are still
+        29 + 6 wide, and must keep their original weight layout."""
         from bot_mmorpg.scripts import test_model
 
         assert len(test_model._MOUSE_WEIGHTS_6) == 6
