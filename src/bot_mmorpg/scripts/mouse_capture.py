@@ -242,6 +242,22 @@ class MouseCapture:
         self._listener.start()
         self._running = True
 
+        # Seed from where the cursor actually is. Without this the first move
+        # event is differenced against (0, 0), so a 20px nudge records as a
+        # full-speed camera whip in both axes and every session opens with a
+        # frame that is a lie.
+        try:
+            pos = mouse.Controller().position
+            self._prev_abs_x = int(pos[0])
+            self._prev_abs_y = int(pos[1])
+            with self._state.lock:
+                self._state.abs_x = self._prev_abs_x
+                self._state.abs_y = self._prev_abs_y
+        except Exception:  # pragma: no cover - cursor position unavailable
+            # Leave the defaults; the first frame after a real move will carry
+            # a bogus delta, which is no worse than not listening at all.
+            pass
+
     def stop(self) -> None:
         """Stop the listener thread."""
         if self._listener is not None:
